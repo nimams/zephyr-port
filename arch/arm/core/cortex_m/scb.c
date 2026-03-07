@@ -26,6 +26,11 @@
 #include <zephyr/arch/arm/cortex_m/scb.h>
 #include <cortex_m/exception.h>
 
+#if defined(CONFIG_SOC_SERIES_RP2040)
+#include <hardware/structs/psm.h>
+#include <hardware/structs/watchdog.h>
+#endif
+
 #if defined(CONFIG_CPU_HAS_NXP_SYSMPU)
 #include <fsl_sysmpu.h>
 #endif
@@ -42,7 +47,24 @@ void __weak sys_arch_reboot(int type)
 {
 	ARG_UNUSED(type);
 
+#if defined(CONFIG_SOC_SERIES_RP2040)
+	/* RP2040 requires full-chip watchdog reset for reliable flash/XIP reboot. */
+	__disable_irq();
+	hw_clear_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_ENABLE_BITS);
+	watchdog_hw->scratch[4] = 0u;
+	hw_set_bits(&psm_hw->wdsel,
+		    PSM_WDSEL_BITS & ~(PSM_WDSEL_ROSC_BITS | PSM_WDSEL_XOSC_BITS));
+	hw_clear_bits(&watchdog_hw->ctrl,
+		      WATCHDOG_CTRL_PAUSE_DBG0_BITS |
+			      WATCHDOG_CTRL_PAUSE_DBG1_BITS |
+			      WATCHDOG_CTRL_PAUSE_JTAG_BITS);
+	hw_set_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_TRIGGER_BITS);
+	for (;;) {
+		__WFI();
+	}
+#else
 	NVIC_SystemReset();
+#endif
 }
 
 #if defined(CONFIG_ARM_MPU)
