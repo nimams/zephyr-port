@@ -10,6 +10,7 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
 
 #include <zephyr/net/mqtt_sn.h>
 #include <zephyr/net/net_ip.h>
@@ -40,6 +41,23 @@ static char *get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
 	return s;
 }
 
+static bool is_multicast_addr(const struct sockaddr *sa)
+{
+	switch (sa->sa_family) {
+	case AF_INET:
+		return net_ipv4_is_addr_mcast(&((struct sockaddr_in *)sa)->sin_addr);
+	case AF_INET6:
+		return net_ipv6_is_addr_mcast(&((struct sockaddr_in6 *)sa)->sin6_addr);
+	default:
+		return false;
+	}
+}
+
+static bool use_nonblocking_recv(void)
+{
+	return IS_ENABLED(CONFIG_MQTT_SN_TRANSPORT_UDP_NONBLOCKING_RECV);
+}
+
 static int tp_udp_init(struct mqtt_sn_transport *transport)
 {
 	struct mqtt_sn_transport_udp *udp = UDP_TRANSPORT(transport);
@@ -47,6 +65,7 @@ static int tp_udp_init(struct mqtt_sn_transport *transport)
 	struct sockaddr addrm;
 	int optval;
 	struct net_if *iface;
+	bool is_multicast;
 
 	udp->sock = zsock_socket(udp->bcaddr.sa_family, SOCK_DGRAM, 0);
 	if (udp->sock < 0) {
@@ -54,6 +73,7 @@ static int tp_udp_init(struct mqtt_sn_transport *transport)
 	}
 
 	LOG_DBG("Socket %d", udp->sock);
+	is_multicast = is_multicast_addr(&udp->bcaddr);
 
 	optval = 1;
 	err = zsock_setsockopt(udp->sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
@@ -87,7 +107,8 @@ static int tp_udp_init(struct mqtt_sn_transport *transport)
 		if (IS_ENABLED(CONFIG_NET_IPV4)) {
 			addrm.sa_family = AF_INET;
 			((struct sockaddr_in *)&addrm)->sin_port =
-				((struct sockaddr_in *)&udp->bcaddr)->sin_port;
+				is_multicast ? ((struct sockaddr_in *)&udp->bcaddr)->sin_port
+					     : htons(0);
 			((struct sockaddr_in *)&addrm)->sin_addr.s_addr = INADDR_ANY;
 		}
 		break;
@@ -95,7 +116,8 @@ static int tp_udp_init(struct mqtt_sn_transport *transport)
 		if (IS_ENABLED(CONFIG_NET_IPV6)) {
 			addrm.sa_family = AF_INET6;
 			((struct sockaddr_in6 *)&addrm)->sin6_port =
-				((struct sockaddr_in6 *)&udp->bcaddr)->sin6_port;
+				is_multicast ? ((struct sockaddr_in6 *)&udp->bcaddr)->sin6_port
+					     : htons(0);
 			memcpy(&((struct sockaddr_in6 *)&addrm)->sin6_addr, &in6addr_any,
 			       sizeof(struct in6_addr));
 			break;
@@ -111,7 +133,7 @@ static int tp_udp_init(struct mqtt_sn_transport *transport)
 		return errno;
 	}
 
-	if (udp->bcaddr.sa_family == AF_INET && IS_ENABLED(CONFIG_NET_IPV4)) {
+	if (is_multicast && udp->bcaddr.sa_family == AF_INET && IS_ENABLED(CONFIG_NET_IPV4)) {
 		struct sockaddr_in *bcaddr_in = (struct sockaddr_in *)&udp->bcaddr;
 		struct ip_mreqn mreqn;
 
@@ -128,7 +150,7 @@ static int tp_udp_init(struct mqtt_sn_transport *transport)
 		if (err < 0) {
 			return errno;
 		}
-	} else if (udp->bcaddr.sa_family == AF_INET6 && IS_ENABLED(CONFIG_NET_IPV6)) {
+	} else if (is_multicast && udp->bcaddr.sa_family == AF_INET6 && IS_ENABLED(CONFIG_NET_IPV6)) {
 		struct sockaddr_in6 *bcaddr_in6 = (struct sockaddr_in6 *)&udp->bcaddr;
 		struct ipv6_mreq mreq;
 
@@ -144,15 +166,18 @@ static int tp_udp_init(struct mqtt_sn_transport *transport)
 		if (err < 0) {
 			return errno;
 		}
-	} else {
+	} else if (is_multicast) {
 		LOG_ERR("Unknown AF");
 		return -EINVAL;
 	}
 
-	optval = CONFIG_MQTT_SN_LIB_BROADCAST_RADIUS;
-	err = zsock_setsockopt(udp->sock, IPPROTO_IP, IP_MULTICAST_TTL, &optval, sizeof(optval));
-	if (err < 0) {
-		return errno;
+	if (is_multicast) {
+		optval = CONFIG_MQTT_SN_LIB_BROADCAST_RADIUS;
+		err = zsock_setsockopt(udp->sock, IPPROTO_IP, IP_MULTICAST_TTL, &optval,
+				       sizeof(optval));
+		if (err < 0) {
+			return errno;
+		}
 	}
 
 	return 0;
@@ -171,22 +196,25 @@ static int tp_udp_sendto(struct mqtt_sn_client *client, void *buf, size_t sz, co
 	struct mqtt_sn_transport_udp *udp = UDP_TRANSPORT(client->transport);
 	int rc;
 	int ttl;
-	socklen_t ttl_len;
+	socklen_t ttl_len = sizeof(ttl);
 
 	if (dest_addr == NULL) {
 		LOG_HEXDUMP_DBG(buf, sz, "Sending Broadcast UDP packet");
 
-		/* Set ttl if requested value does not match existing*/
-		rc = zsock_getsockopt(udp->sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, &ttl_len);
-		if (rc < 0) {
-			return -errno;
-		}
-		if (ttl != addrlen) {
-			ttl = addrlen;
-			rc = zsock_setsockopt(udp->sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
-					      sizeof(ttl));
+		if (is_multicast_addr(&udp->bcaddr)) {
+			/* Set ttl if requested value does not match existing*/
+			rc = zsock_getsockopt(udp->sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
+					      &ttl_len);
 			if (rc < 0) {
 				return -errno;
+			}
+			if (ttl != addrlen) {
+				ttl = addrlen;
+				rc = zsock_setsockopt(udp->sock, IPPROTO_IP, IP_MULTICAST_TTL,
+						      &ttl, sizeof(ttl));
+				if (rc < 0) {
+					return -errno;
+				}
 			}
 		}
 
@@ -214,10 +242,14 @@ static ssize_t tp_udp_recvfrom(struct mqtt_sn_client *client, void *buffer, size
 	int rc;
 	struct sockaddr *srcaddr = src_addr;
 	socklen_t addrlen_local = *addrlen;
+	int flags = use_nonblocking_recv() ? ZSOCK_MSG_DONTWAIT : 0;
 
-	rc = zsock_recvfrom(udp->sock, buffer, length, 0, src_addr, &addrlen_local);
+	rc = zsock_recvfrom(udp->sock, buffer, length, flags, src_addr, &addrlen_local);
 	LOG_DBG("recv %d", rc);
 	if (rc < 0) {
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			LOG_WRN("MQTT-SN UDP recv failed: errno=%d", errno);
+		}
 		return -errno;
 	}
 	*addrlen = addrlen_local;
@@ -241,6 +273,14 @@ static int tp_udp_poll(struct mqtt_sn_client *client)
 {
 	struct mqtt_sn_transport_udp *udp = UDP_TRANSPORT(client->transport);
 	int rc;
+
+	if (use_nonblocking_recv()) {
+		/* Some socket offload backends can miss a zero-timeout poll.
+		 * The matching recv path uses MSG_DONTWAIT, so it is safe to let
+		 * mqtt_sn_input() try recvfrom every tick.
+		 */
+		return 1;
+	}
 
 	struct zsock_pollfd pollfd = {
 		.fd = udp->sock,

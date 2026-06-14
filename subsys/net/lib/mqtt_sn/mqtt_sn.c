@@ -1759,7 +1759,12 @@ static void handle_suback(struct mqtt_sn_client *client, struct mqtt_sn_param_su
 		topic->topic_id = p->topic_id;
 		topic->qos = p->qos;
 	} else {
-		LOG_WRN("SUBACK with ret code %d", p->ret_code);
+		LOG_WRN("SUBACK with ret code %d for topic, resetting for retry", p->ret_code);
+		/* Reset to SUBSCRIBE so the next process_work cycle resends the packet.
+		 * Without this, the topic stays stuck in SUBSCRIBING and mqtt_sn_subscribe()
+		 * returns -EALREADY forever, making retry impossible. */
+		topic->state = MQTT_SN_TOPIC_STATE_SUBSCRIBE;
+		k_work_reschedule(&client->process_work, K_SECONDS(5));
 	}
 }
 

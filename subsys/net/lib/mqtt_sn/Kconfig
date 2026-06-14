@@ -69,6 +69,15 @@ config MQTT_SN_TRANSPORT_UDP
 	select NET_IPV4_IGMP if NET_IPV4
 	select NET_IPV6_MLD if NET_IPV6
 
+config MQTT_SN_TRANSPORT_UDP_NONBLOCKING_RECV
+	bool "Try MQTT-SN UDP receive without a ready poll event"
+	depends on MQTT_SN_TRANSPORT_UDP
+	default y if NET_NATIVE_OFFLOADED_SOCKETS
+	help
+	  Try recvfrom() with MSG_DONTWAIT even when a zero-timeout socket poll
+	  does not report data. This is useful for socket offload backends where
+	  readiness notifications can lag behind received datagrams.
+
 config MQTT_SN_LIB_N_RETRY
 	int "Number of times to retry messages"
 	range 1 20
