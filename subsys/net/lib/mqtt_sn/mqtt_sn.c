@@ -192,6 +192,7 @@ static struct mqtt_sn_publish *mqtt_sn_publish_create(struct mqtt_sn_client *cli
 	if (data && data->data && data->size) {
 		if (data->size > sizeof(pub->pubdata)) {
 			LOG_ERR("Can't create PUB: Too much data (%zu)", data->size);
+			k_mem_slab_free(&publishes, (void *)pub);
 			return NULL;
 		}
 
@@ -318,14 +319,13 @@ static void mqtt_sn_topic_destroy(struct mqtt_sn_client *client, struct mqtt_sn_
 	sys_slist_find_and_remove(&client->topic, &topic->next);
 }
 
-static void mqtt_sn_topic_destroy_all(struct mqtt_sn_client *client)
+static void mqtt_sn_topic_destroy_all(struct mqtt_sn_client *client, bool keep_stateless)
 {
 	struct mqtt_sn_topic *topic;
+	struct mqtt_sn_topic *tnext;
 	struct mqtt_sn_publish *pub;
-	sys_snode_t *next;
 
-	while ((next = sys_slist_get(&client->topic)) != NULL) {
-		topic = SYS_SLIST_CONTAINER(next, topic, next);
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&client->topic, topic, tnext, next) {
 		/* Destroy all pubs referencing this topic */
 		while ((pub = mqtt_sn_publish_find_by_topic(client, topic)) != NULL) {
 			LOG_WRN("Destroying publish msg_id %d", pub->con.msg_id);
@@ -333,11 +333,13 @@ static void mqtt_sn_topic_destroy_all(struct mqtt_sn_client *client)
 		}
 
 		/* Keep these around since they are valid without a connection */
-		if (topic->type == MQTT_SN_TOPIC_TYPE_PREDEF ||
-		    topic->type == MQTT_SN_TOPIC_TYPE_SHORT) {
+		if (keep_stateless &&
+		    (topic->type == MQTT_SN_TOPIC_TYPE_PREDEF ||
+		     topic->type == MQTT_SN_TOPIC_TYPE_SHORT)) {
 			continue;
 		}
 
+		sys_slist_find_and_remove(&client->topic, &topic->next);
 		k_mem_slab_free(&topics, (void *)topic);
 	}
 }
@@ -356,7 +358,6 @@ static void mqtt_sn_gw_destroy_all(struct mqtt_sn_client *client)
 
 	while ((next = sys_slist_get(&client->gateway)) != NULL) {
 		gw = SYS_SLIST_CONTAINER(next, gw, next);
-		sys_slist_find_and_remove(&client->gateway, next);
 		k_mem_slab_free(&gateways, (void *)gw);
 	}
 }
@@ -1033,8 +1034,10 @@ static int process_ping(struct mqtt_sn_client *client, int64_t *next_cycle)
 			LOG_WRN("Ping ran out of retries");
 			mqtt_sn_disconnect_internal(client);
 			SYS_SLIST_PEEK_HEAD_CONTAINER(&client->gateway, gw, next);
-			LOG_DBG("Removing non-responsive GW 0x%08x", gw->gw_id);
-			mqtt_sn_gw_destroy(client, gw);
+			if (gw != NULL) {
+				LOG_DBG("Removing non-responsive GW 0x%08x", gw->gw_id);
+				mqtt_sn_gw_destroy(client, gw);
+			}
 			return -ETIMEDOUT;
 		}
 
@@ -1225,15 +1228,15 @@ void mqtt_sn_client_deinit(struct mqtt_sn_client *client)
 		return;
 	}
 
+	k_work_cancel_delayable(&client->process_work);
+
 	mqtt_sn_publish_destroy_all(client);
-	mqtt_sn_topic_destroy_all(client);
+	mqtt_sn_topic_destroy_all(client, false);
 	mqtt_sn_gw_destroy_all(client);
 
 	if (client->transport && client->transport->deinit) {
 		client->transport->deinit(client->transport);
 	}
-
-	k_work_cancel_delayable(&client->process_work);
 }
 
 int mqtt_sn_add_gw(struct mqtt_sn_client *client, uint8_t gw_id, struct mqtt_sn_data gw_addr)
@@ -1284,7 +1287,7 @@ int mqtt_sn_connect(struct mqtt_sn_client *client, bool will, bool clean_session
 	}
 
 	if (clean_session) {
-		mqtt_sn_topic_destroy_all(client);
+		mqtt_sn_topic_destroy_all(client, true);
 	}
 
 	p.params.connect.clean_session = clean_session;
